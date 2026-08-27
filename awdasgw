@@ -1,0 +1,2980 @@
+--[[
+    Bee Swarm Simulator - Compact Purchase / Blender / Info GUI
+
+    GAMEPLAY ACTIONS:
+    - Royal Jelly purchase
+    - Egg purchases
+    - Ticket purchases
+    - Blender PlaceOrder
+    - Blender StopOrder
+    - Blender SpeedUpOrder
+
+    READ-ONLY:
+    - Player information
+    - Inventory
+    - Recipe Calculator
+    - Blender ingredient checks
+    - Blender requirement checks
+    - Speed Up cost display
+
+    SUPPLIED GAME MODULES USED:
+    - ClientStatCache
+    - BlenderRecipes
+    - EggTypes
+    - StatTools
+
+    NO exploit APIs / hooks / metamethods / teleportation.
+]]
+
+--==================================================
+-- SERVICES
+--==================================================
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then
+    return
+end
+
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+--==================================================
+-- GAME MODULES
+--==================================================
+
+local ClientStatCache = require(
+    ReplicatedStorage:WaitForChild("ClientStatCache")
+)
+
+local BlenderRecipes = require(
+    ReplicatedStorage:WaitForChild("BlenderRecipes")
+)
+
+local EggTypes = require(
+    ReplicatedStorage:WaitForChild("EggTypes")
+)
+
+local StatTools = require(
+    ReplicatedStorage:WaitForChild("StatTools")
+)
+
+--==================================================
+-- GAMEPLAY REMOTES
+--==================================================
+
+local Events = ReplicatedStorage:WaitForChild("Events")
+
+local ItemPackageEvent = Events:WaitForChild("ItemPackageEvent")
+local BlenderCommand = Events:WaitForChild("BlenderCommand")
+
+--==================================================
+-- CONFIGURATION
+--==================================================
+
+local REFRESH_INTERVAL = 1
+local REQUEST_COOLDOWN = 0.75
+
+local MAX_AMOUNT = 1000000
+local MAX_BLENDER_COUNT = 100000
+
+local ROYAL_JELLY_AMOUNTS = {
+    1,
+    10,
+    100,
+    500,
+    1000,
+}
+
+local TICKET_AMOUNTS = {
+    1,
+    10,
+    100,
+    500,
+}
+
+local RECIPES = {
+    "RedExtract",
+    "BlueExtract",
+    "Glue",
+    "Enzymes",
+    "Oil",
+    "Gumdrops",
+    "MoonCharm",
+    "Glitter",
+    "StarJelly",
+    "TropicalDrink",
+    "PurplePotion",
+    "SuperSmoothie",
+    "SoftWax",
+    "HardWax",
+    "CausticWax",
+    "SwirledWax",
+    "FieldDice",
+    "SmoothDice",
+    "LoadedDice",
+    "Turpentine",
+}
+
+local INVENTORY_ITEMS = {
+    "RoyalJelly",
+    "Gumdrops",
+    "RedExtract",
+    "BlueExtract",
+    "Enzymes",
+    "Oil",
+    "Glue",
+    "Glitter",
+    "Tickets",
+    "Strawberry",
+    "Blueberry",
+    "Pineapple",
+    "SunflowerSeed",
+    "MoonCharm",
+    "MagicBean",
+    "Coconut",
+    "Neonberry",
+    "Honeysuckle",
+    "Bitterberry",
+    "Whirligig",
+    "StarJelly",
+    "PurplePotion",
+    "TropicalDrink",
+    "SuperSmoothie",
+    "SoftWax",
+    "HardWax",
+    "CausticWax",
+    "SwirledWax",
+    "FieldDice",
+    "SmoothDice",
+    "LoadedDice",
+    "Turpentine",
+}
+
+local EGG_CONFIG = {
+    {
+        Name = "Silver Egg",
+        Type = "Silver",
+        Cost = 50,
+    },
+    {
+        Name = "Golden Egg",
+        Type = "Golden",
+        Cost = 100,
+    },
+    {
+        Name = "Diamond Egg",
+        Type = "Diamond",
+        Cost = 400,
+    },
+    {
+        Name = "Star Treat",
+        Type = "StarTreat",
+        Cost = 1000,
+    },
+}
+
+--==================================================
+-- STATE
+--==================================================
+
+local selectedRoyalJellyAmount = 1000
+local selectedTicketAmount = 1
+local selectedRecipe = RECIPES[1]
+
+local requestInProgress = false
+local lastRequestTime = 0
+
+local latestStats = nil
+
+--==================================================
+-- UTILITY
+--==================================================
+
+local function formatNumber(value)
+    if typeof(value) ~= "number" then
+        return "N/A"
+    end
+
+    if value ~= value then
+        return "N/A"
+    end
+
+    if value == math.huge then
+        return "∞"
+    end
+
+    if value == -math.huge then
+        return "-∞"
+    end
+
+    local negative = value < 0
+    value = math.abs(value)
+
+    local result = tostring(math.floor(value))
+
+    while true do
+        local replacement, count = result:gsub(
+            "^(-?%d+)(%d%d%d)",
+            "%1,%2"
+        )
+
+        result = replacement
+
+        if count == 0 then
+            break
+        end
+    end
+
+    if negative then
+        result = "-" .. result
+    end
+
+    return result
+end
+
+local function validatePositiveInteger(text, maximum)
+    text = tostring(text or ""):gsub("%s+", "")
+
+    if text == "" then
+        return nil, "Enter a positive integer."
+    end
+
+    if not text:match("^%d+$") then
+        return nil, "Enter a positive integer."
+    end
+
+    local number = tonumber(text)
+
+    if not number then
+        return nil, "Invalid number."
+    end
+
+    if number <= 0 then
+        return nil, "Number must be greater than 0."
+    end
+
+    if number ~= math.floor(number) then
+        return nil, "Number must be an integer."
+    end
+
+    if maximum and number > maximum then
+        return nil, "Number exceeds the limit."
+    end
+
+    return number
+end
+
+local function safeCall(callback)
+    local success, result = pcall(callback)
+
+    if success then
+        return true, result
+    end
+
+    return false, nil
+end
+
+--==================================================
+-- GUI CREATION
+--==================================================
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "BeeUtilityGUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.DisplayOrder = 1000
+ScreenGui.Enabled = true
+ScreenGui.Parent = PlayerGui
+
+local UIScale = Instance.new("UIScale")
+UIScale.Scale = 1
+UIScale.Parent = ScreenGui
+
+local Main = Instance.new("Frame")
+Main.Name = "Main"
+Main.Size = UDim2.fromOffset(920, 540)
+Main.AnchorPoint = Vector2.new(0.5, 0.5)
+Main.Position = UDim2.fromScale(0.5, 0.5)
+Main.Visible = true
+Main.Active = true
+Main.ZIndex = 10
+Main.BackgroundColor3 = Color3.fromRGB(18, 20, 26)
+Main.BackgroundTransparency = 0
+Main.BorderSizePixel = 0
+Main.ClipsDescendants = false
+Main.Parent = ScreenGui
+
+local MainCorner = Instance.new("UICorner")
+MainCorner.CornerRadius = UDim.new(0, 16)
+MainCorner.Parent = Main
+
+local MainStroke = Instance.new("UIStroke")
+MainStroke.Color = Color3.fromRGB(59, 63, 76)
+MainStroke.Thickness = 1
+MainStroke.Transparency = 0.15
+MainStroke.Parent = Main
+
+local MainGradient = Instance.new("UIGradient")
+MainGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(24, 27, 35)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(16, 18, 23)),
+})
+MainGradient.Rotation = 90
+MainGradient.Parent = Main
+
+-- Small restore control used whenever the main panel is hidden.
+local MiniBox = Instance.new("TextButton")
+MiniBox.Name = "MiniBox"
+MiniBox.Size = UDim2.fromOffset(170, 46)
+MiniBox.Position = UDim2.new(1, -190, 1, -66)
+MiniBox.BackgroundColor3 = Color3.fromRGB(28, 31, 39)
+MiniBox.BorderSizePixel = 0
+MiniBox.AutoButtonColor = true
+MiniBox.Text = "🐝  Bee Utility"
+MiniBox.TextColor3 = Color3.fromRGB(245, 247, 250)
+MiniBox.TextSize = 13
+MiniBox.Font = Enum.Font.GothamBold
+MiniBox.Visible = false
+MiniBox.ZIndex = 1000
+MiniBox.Parent = ScreenGui
+
+local MiniCorner = Instance.new("UICorner")
+MiniCorner.CornerRadius = UDim.new(0, 12)
+MiniCorner.Parent = MiniBox
+
+local MiniStroke = Instance.new("UIStroke")
+MiniStroke.Color = Color3.fromRGB(79, 84, 102)
+MiniStroke.Thickness = 1
+MiniStroke.Parent = MiniBox
+
+local MiniAccent = Instance.new("Frame")
+MiniAccent.Size = UDim2.fromOffset(4, 24)
+MiniAccent.Position = UDim2.new(0, 9, 0.5, -12)
+MiniAccent.BackgroundColor3 = Color3.fromRGB(244, 190, 63)
+MiniAccent.BorderSizePixel = 0
+MiniAccent.ZIndex = 201
+MiniAccent.Parent = MiniBox
+
+local MiniAccentCorner = Instance.new("UICorner")
+MiniAccentCorner.CornerRadius = UDim.new(1, 0)
+MiniAccentCorner.Parent = MiniAccent
+
+local MiniPadding = Instance.new("UIPadding")
+MiniPadding.PaddingLeft = UDim.new(0, 22)
+MiniPadding.PaddingRight = UDim.new(0, 8)
+MiniPadding.Parent = MiniBox
+
+--==================================================
+-- RESPONSIVE SCALE
+--==================================================
+
+local function updateScale()
+    local camera = workspace.CurrentCamera
+
+    if not camera then
+        return
+    end
+
+    local viewport = camera.ViewportSize
+
+    local scaleX = viewport.X / 980
+    local scaleY = viewport.Y / 600
+
+    local scale = math.min(scaleX, scaleY)
+
+    scale = math.clamp(scale, 0.50, 1)
+
+    UIScale.Scale = scale
+end
+
+updateScale()
+
+if workspace.CurrentCamera then
+    workspace.CurrentCamera:GetPropertyChangedSignal(
+        "ViewportSize"
+    ):Connect(updateScale)
+end
+
+--==================================================
+-- COMMON GUI FUNCTIONS
+--==================================================
+
+local function addCorner(object, radius)
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, radius or 7)
+    corner.Parent = object
+    return corner
+end
+
+local function addStroke(object, color, transparency, thickness)
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = color or Color3.fromRGB(69, 74, 88)
+    stroke.Transparency = transparency == nil and 0.15 or transparency
+    stroke.Thickness = thickness or 1
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    stroke.Parent = object
+    return stroke
+end
+
+local function makeLabel(
+    parent,
+    text,
+    position,
+    size,
+    textSize
+)
+    local label = Instance.new("TextLabel")
+
+    label.BackgroundTransparency = 1
+    label.Position = position
+    label.Size = size
+    label.Text = text
+    label.TextColor3 = Color3.fromRGB(229, 232, 238)
+    label.TextSize = textSize or 12
+    label.Font = Enum.Font.Gotham
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextYAlignment = Enum.TextYAlignment.Center
+    label.TextWrapped = false
+    label.Parent = parent
+
+    return label
+end
+
+local function makeButton(
+    parent,
+    text,
+    position,
+    size
+)
+    local button = Instance.new("TextButton")
+
+    button.Position = position
+    button.Size = size
+    button.BackgroundColor3 = Color3.fromRGB(45, 50, 62)
+    button.BorderSizePixel = 0
+    button.Text = text
+    button.TextColor3 = Color3.fromRGB(245, 247, 250)
+    button.TextSize = 12
+    button.Font = Enum.Font.GothamSemibold
+    button.AutoButtonColor = true
+    button.TextTruncate = Enum.TextTruncate.AtEnd
+    button.Parent = parent
+
+    addCorner(button, 9)
+    addStroke(button, Color3.fromRGB(75, 80, 96), 0.35, 1)
+
+    return button
+end
+
+local function makeTextBox(
+    parent,
+    text,
+    position,
+    size,
+    placeholder
+)
+    local box = Instance.new("TextBox")
+
+    box.Position = position
+    box.Size = size
+    box.BackgroundColor3 = Color3.fromRGB(31, 35, 44)
+    box.BorderSizePixel = 0
+    box.Text = text or ""
+    box.PlaceholderText = placeholder or ""
+    box.PlaceholderColor3 = Color3.fromRGB(128, 134, 146)
+    box.TextColor3 = Color3.fromRGB(248, 249, 252)
+    box.TextSize = 12
+    box.Font = Enum.Font.Gotham
+    box.ClearTextOnFocus = false
+    box.TextXAlignment = Enum.TextXAlignment.Left
+    box.Parent = parent
+
+    addCorner(box, 9)
+    addStroke(box, Color3.fromRGB(70, 75, 90), 0.3, 1)
+
+    local padding = Instance.new("UIPadding")
+    padding.PaddingLeft = UDim.new(0, 10)
+    padding.PaddingRight = UDim.new(0, 8)
+    padding.Parent = box
+
+    return box
+end
+
+--==================================================
+-- HEADER
+--==================================================
+
+local Header = Instance.new("Frame")
+Header.Size = UDim2.new(1, 0, 0, 72)
+Header.BackgroundTransparency = 1
+Header.Visible = true
+Header.ZIndex = 30
+Header.Parent = Main
+Header.Active = true
+
+local Title = makeLabel(
+    Header,
+    "🐝 Bee Utility",
+    UDim2.fromOffset(24, 6),
+    UDim2.fromOffset(210, 28),
+    18
+)
+
+Title.Font = Enum.Font.GothamBold
+Title.TextColor3 = Color3.fromRGB(250, 251, 253)
+
+local StatBar = makeLabel(
+    Header,
+    "🍯 Honey: N/A    🐝 Hive: N/A    🎟️ Tickets: N/A",
+    UDim2.fromOffset(240, 7),
+    UDim2.new(1, -340, 0, 22),
+    11
+)
+
+StatBar.TextXAlignment = Enum.TextXAlignment.Right
+StatBar.TextColor3 = Color3.fromRGB(169, 175, 187)
+
+local MinimizeButton = makeButton(
+    Header,
+    "—",
+    UDim2.new(1, -92, 0, 9),
+    UDim2.fromOffset(32, 30)
+)
+
+MinimizeButton.BackgroundColor3 = Color3.fromRGB(40, 44, 54)
+MinimizeButton.TextColor3 = Color3.fromRGB(202, 208, 218)
+
+local CloseButton = makeButton(
+    Header,
+    "×",
+    UDim2.new(1, -52, 0, 9),
+    UDim2.fromOffset(32, 30)
+)
+
+CloseButton.BackgroundColor3 = Color3.fromRGB(89, 48, 56)
+CloseButton.TextColor3 = Color3.fromRGB(255, 215, 218)
+
+local StatusLabel = makeLabel(
+    Header,
+    "Status: Ready",
+    UDim2.fromOffset(24, 39),
+    UDim2.new(1, -120, 0, 22),
+    11
+)
+
+StatusLabel.TextColor3 = Color3.fromRGB(139, 146, 159)
+
+local function setStatus(message, state)
+    StatusLabel.Text = "Status: " .. tostring(message)
+
+    if state == "success" then
+        StatusLabel.TextColor3 = Color3.fromRGB(100, 240, 135)
+    elseif state == "error" then
+        StatusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+    elseif state == "warning" then
+        StatusLabel.TextColor3 = Color3.fromRGB(255, 215, 100)
+    else
+        StatusLabel.TextColor3 = Color3.fromRGB(175, 175, 185)
+    end
+end
+
+--==================================================
+-- SIDEBAR NAVIGATION
+--==================================================
+
+local TabBar = Instance.new("ScrollingFrame")
+TabBar.Name = "Sidebar"
+TabBar.Position = UDim2.fromOffset(16, 78)
+TabBar.Size = UDim2.fromOffset(184, 446)
+TabBar.BackgroundColor3 = Color3.fromRGB(24, 28, 36)
+TabBar.BorderSizePixel = 0
+TabBar.CanvasSize = UDim2.fromOffset(0, 0)
+TabBar.ScrollBarThickness = 3
+TabBar.ScrollBarImageColor3 = Color3.fromRGB(83, 90, 107)
+TabBar.ScrollBarImageTransparency = 0.35
+TabBar.ScrollingDirection = Enum.ScrollingDirection.Y
+TabBar.Visible = true
+TabBar.ZIndex = 20
+TabBar.Parent = Main
+TabBar.ClipsDescendants = true
+
+addCorner(TabBar, 12)
+addStroke(TabBar, Color3.fromRGB(54, 59, 72), 0.2, 1)
+
+local SidebarTitle = makeLabel(
+    Main,
+    "FEATURES",
+    UDim2.fromOffset(30, 84),
+    UDim2.fromOffset(150, 24),
+    11
+)
+SidebarTitle.Font = Enum.Font.GothamBold
+SidebarTitle.TextColor3 = Color3.fromRGB(139, 146, 159)
+SidebarTitle.ZIndex = 31
+
+local TabLayout = Instance.new("UIListLayout")
+TabLayout.FillDirection = Enum.FillDirection.Vertical
+TabLayout.Padding = UDim.new(0, 6)
+TabLayout.SortOrder = Enum.SortOrder.LayoutOrder
+TabLayout.Parent = TabBar
+TabLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+local SidebarPadding = Instance.new("UIPadding")
+SidebarPadding.PaddingTop = UDim.new(0, 48)
+SidebarPadding.PaddingLeft = UDim.new(0, 10)
+SidebarPadding.PaddingRight = UDim.new(0, 10)
+SidebarPadding.PaddingBottom = UDim.new(0, 10)
+SidebarPadding.Parent = TabBar
+
+local function updateTabCanvas()
+    TabBar.CanvasSize = UDim2.fromOffset(
+        0,
+        TabLayout.AbsoluteContentSize.Y + 60
+    )
+end
+
+TabLayout:GetPropertyChangedSignal(
+    "AbsoluteContentSize"
+):Connect(updateTabCanvas)
+
+--==================================================
+-- RIGHT-SIDE FEATURE CONTENT
+--==================================================
+
+local Content = Instance.new("Frame")
+Content.Name = "FeatureContent"
+Content.Position = UDim2.fromOffset(210, 78)
+Content.Size = UDim2.new(1, -226, 1, -94)
+Content.BackgroundColor3 = Color3.fromRGB(23, 26, 33)
+Content.BorderSizePixel = 0
+Content.ZIndex = 11
+Content.Parent = Main
+Content.ClipsDescendants = true
+
+addCorner(Content, 12)
+addStroke(Content, Color3.fromRGB(54, 59, 72), 0.25, 1)
+
+--==================================================
+-- PAGE / SIDEBAR SYSTEM
+--==================================================
+
+local Pages = {}
+local Tabs = {}
+
+local function createPage(name)
+    local page = Instance.new("Frame")
+
+    page.Name = name
+    page.Size = UDim2.new(1, -18, 1, -18)
+    page.Position = UDim2.fromOffset(9, 9)
+    page.BackgroundTransparency = 1
+    page.Visible = false
+    page.ZIndex = 12
+    page.Parent = Content
+
+    Pages[name] = page
+
+    return page
+end
+
+local function createTab(name)
+    local button = makeButton(
+        TabBar,
+        name,
+        UDim2.new(),
+        UDim2.new(1, 0, 0, 42)
+    )
+
+    button.BackgroundColor3 = Color3.fromRGB(31, 35, 44)
+    button.TextColor3 = Color3.fromRGB(171, 178, 191)
+    button.TextSize = 12
+    button.TextXAlignment = Enum.TextXAlignment.Left
+    button.AutoButtonColor = true
+    button.ZIndex = 25
+
+    addStroke(button, Color3.fromRGB(58, 63, 76), 0.45, 1)
+
+    local padding = Instance.new("UIPadding")
+    padding.PaddingLeft = UDim.new(0, 14)
+    padding.PaddingRight = UDim.new(0, 10)
+    padding.Parent = button
+
+    Tabs[name] = button
+
+    return button
+end
+
+local function selectTab(name)
+    for pageName, page in pairs(Pages) do
+        page.Visible = pageName == name
+    end
+
+    for tabName, button in pairs(Tabs) do
+        if tabName == name then
+            button.BackgroundColor3 = Color3.fromRGB(62, 97, 176)
+            button.TextColor3 = Color3.fromRGB(255, 255, 255)
+            button.TextSize = 12
+        else
+            button.BackgroundColor3 = Color3.fromRGB(31, 35, 44)
+            button.TextColor3 = Color3.fromRGB(171, 178, 191)
+            button.TextSize = 12
+        end
+    end
+end
+
+--==================================================
+-- PAGE HELPERS
+--==================================================
+
+local function makePanel(parent, position, size)
+    local panel = Instance.new("Frame")
+
+    panel.Position = position
+    panel.Size = size
+    panel.BackgroundColor3 = Color3.fromRGB(29, 33, 42)
+    panel.BorderSizePixel = 0
+    panel.ZIndex = 13
+    panel.Parent = parent
+
+    addCorner(panel, 10)
+    addStroke(panel, Color3.fromRGB(57, 62, 76), 0.3, 1)
+
+    return panel
+end
+
+local function makeScrollingList(
+    parent,
+    position,
+    size
+)
+    local scroll = Instance.new("ScrollingFrame")
+
+    scroll.Position = position
+    scroll.Size = size
+    scroll.BackgroundColor3 = Color3.fromRGB(24, 28, 36)
+    scroll.BorderSizePixel = 0
+    scroll.ScrollBarThickness = 3
+    scroll.ScrollBarImageColor3 = Color3.fromRGB(83, 90, 107)
+    scroll.ScrollBarImageTransparency = 0.25
+    scroll.CanvasSize = UDim2.fromOffset(0, 0)
+    scroll.ZIndex = 14
+    scroll.Parent = parent
+
+    addCorner(scroll, 9)
+    addStroke(scroll, Color3.fromRGB(53, 58, 71), 0.4, 1)
+
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 4)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Parent = scroll
+
+    layout:GetPropertyChangedSignal(
+        "AbsoluteContentSize"
+    ):Connect(function()
+        scroll.CanvasSize = UDim2.fromOffset(
+            0,
+            layout.AbsoluteContentSize.Y + 8
+        )
+    end)
+
+    return scroll
+end
+
+--==================================================
+-- GAMEPLAY REQUEST PROTECTION
+--==================================================
+
+local function canSendRequest()
+    if requestInProgress then
+        setStatus(
+            "Another request is still running.",
+            "warning"
+        )
+        return false
+    end
+
+    local elapsed = os.clock() - lastRequestTime
+
+    if elapsed < REQUEST_COOLDOWN then
+        setStatus(
+            string.format(
+                "Please wait %.1f seconds.",
+                REQUEST_COOLDOWN - elapsed
+            ),
+            "warning"
+        )
+        return false
+    end
+
+    return true
+end
+
+--==================================================
+-- ITEM PURCHASE
+--==================================================
+
+local function purchaseItem(
+    itemType,
+    amount,
+    displayName
+)
+    if not canSendRequest() then
+        return
+    end
+
+    requestInProgress = true
+    lastRequestTime = os.clock()
+
+    setStatus(
+        "Sending " .. displayName .. "...",
+        "warning"
+    )
+
+    local success, result = pcall(function()
+        return ItemPackageEvent:InvokeServer(
+            "Purchase",
+            {
+                Type = itemType,
+                Category = "Eggs",
+                Amount = amount,
+            }
+        )
+    end)
+
+    requestInProgress = false
+
+    if success then
+        setStatus(
+            displayName .. " request completed.",
+            "success"
+        )
+    else
+        setStatus(
+            displayName .. " failed: " .. tostring(result),
+            "error"
+        )
+        warn(
+            "[BeeUtility] ItemPackageEvent:",
+            result
+        )
+    end
+end
+
+--==================================================
+-- BLENDER REMOTE
+--==================================================
+
+local function invokeBlender(
+    command,
+    data,
+    successMessage
+)
+    if not canSendRequest() then
+        return
+    end
+
+    requestInProgress = true
+    lastRequestTime = os.clock()
+
+    setStatus(
+        "Sending Blender command...",
+        "warning"
+    )
+
+    local success, result = pcall(function()
+        if data then
+            return BlenderCommand:InvokeServer(
+                command,
+                data
+            )
+        end
+
+        return BlenderCommand:InvokeServer(
+            command
+        )
+    end)
+
+    requestInProgress = false
+
+    if success then
+        setStatus(
+            successMessage,
+            "success"
+        )
+
+        return true, result
+    end
+
+    setStatus(
+        "Blender error: " .. tostring(result),
+        "error"
+    )
+
+    warn(
+        "[BeeUtility] BlenderCommand:",
+        result
+    )
+
+    return false, nil
+end
+
+--==================================================
+-- PAGE 1: ROYAL JELLY
+--==================================================
+
+local RoyalPage = createPage("Royal Jelly")
+local RoyalTab = createTab("Royal Jelly")
+
+local RoyalPanel = makePanel(
+    RoyalPage,
+    UDim2.fromOffset(14, 14),
+    UDim2.new(1, -28, 0, 126)
+)
+
+makeLabel(
+    RoyalPanel,
+    "Royal Jelly Amount",
+    UDim2.fromOffset(14, 10),
+    UDim2.fromOffset(220, 22),
+    14
+)
+
+local RoyalButtons = {}
+
+local RoyalAmountFrame = Instance.new("Frame")
+RoyalAmountFrame.Position = UDim2.fromOffset(14, 40)
+RoyalAmountFrame.Size = UDim2.new(1, -28, 0, 36)
+RoyalAmountFrame.BackgroundTransparency = 1
+RoyalAmountFrame.Parent = RoyalPanel
+
+local RoyalLayout = Instance.new("UIListLayout")
+RoyalLayout.FillDirection = Enum.FillDirection.Horizontal
+RoyalLayout.Padding = UDim.new(0, 6)
+RoyalLayout.Parent = RoyalAmountFrame
+
+local function updateRoyalButtons()
+    for amount, button in pairs(RoyalButtons) do
+        if amount == selectedRoyalJellyAmount then
+            button.BackgroundColor3 = Color3.fromRGB(62, 97, 176)
+        else
+            button.BackgroundColor3 = Color3.fromRGB(48, 48, 59)
+        end
+    end
+end
+
+for _, amount in ipairs(ROYAL_JELLY_AMOUNTS) do
+    local button = makeButton(
+        RoyalAmountFrame,
+        tostring(amount),
+        UDim2.new(),
+        UDim2.fromOffset(75, 34)
+    )
+
+    button.BackgroundColor3 = Color3.fromRGB(38, 43, 53)
+    button.TextColor3 = Color3.fromRGB(203, 209, 219)
+    RoyalButtons[amount] = button
+
+    button.MouseButton1Click:Connect(function()
+        selectedRoyalJellyAmount = amount
+        updateRoyalButtons()
+    end)
+end
+
+local RoyalPurchaseButton = makeButton(
+    RoyalPanel,
+    "Purchase Royal Jelly",
+    UDim2.fromOffset(14, 84),
+    UDim2.new(1, -28, 0, 35)
+)
+
+RoyalPurchaseButton.MouseButton1Click:Connect(function()
+    purchaseItem(
+        "RoyalJelly",
+        selectedRoyalJellyAmount,
+        "Royal Jelly"
+    )
+end)
+
+updateRoyalButtons()
+
+--==================================================
+-- PAGE 2: EGGS
+--==================================================
+
+local EggsPage = createPage("Eggs")
+local EggsTab = createTab("Eggs")
+
+for index, config in ipairs(EGG_CONFIG) do
+    local y = 10 + ((index - 1) * 67)
+
+    local row = makePanel(
+        EggsPage,
+        UDim2.fromOffset(12, y),
+        UDim2.new(1, -24, 0, 57)
+    )
+
+    local title = makeLabel(
+        row,
+        config.Name,
+        UDim2.fromOffset(12, 5),
+        UDim2.new(0.45, 0, 0, 22),
+        13
+    )
+
+    title.Font = Enum.Font.GothamBold
+
+    makeLabel(
+        row,
+        tostring(config.Cost) .. " Tickets",
+        UDim2.fromOffset(12, 28),
+        UDim2.fromOffset(180, 20),
+        11
+    )
+
+    local purchaseButton = makeButton(
+        row,
+        "Purchase",
+        UDim2.new(1, -120, 0, 11),
+        UDim2.fromOffset(105, 34)
+    )
+
+    purchaseButton.MouseButton1Click:Connect(function()
+        purchaseItem(
+            config.Type,
+            1,
+            config.Name
+        )
+    end)
+end
+
+--==================================================
+-- PAGE 3: BLENDER
+--==================================================
+
+local BlenderPage = createPage("Blender")
+local BlenderTab = createTab("Blender")
+
+--==================================================
+-- BLENDER TOP HEADER
+--==================================================
+
+local BlenderHeader = makePanel(
+    BlenderPage,
+    UDim2.fromOffset(10, 8),
+    UDim2.new(1, -20, 0, 54)
+)
+
+local RecipeHeaderLabel = makeLabel(
+    BlenderHeader,
+    "Recipe",
+    UDim2.fromOffset(12, 5),
+    UDim2.fromOffset(90, 18),
+    11
+)
+RecipeHeaderLabel.Font = Enum.Font.GothamBold
+RecipeHeaderLabel.TextColor3 = Color3.fromRGB(139, 146, 159)
+
+local RecipeButton = makeButton(
+    BlenderHeader,
+    selectedRecipe,
+    UDim2.fromOffset(10, 24),
+    UDim2.new(0.42, -14, 0, 28)
+)
+RecipeButton.BackgroundColor3 = Color3.fromRGB(62, 97, 176)
+RecipeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+RecipeButton.ZIndex = 35
+
+local AmountHeaderLabel = makeLabel(
+    BlenderHeader,
+    "Amount",
+    UDim2.new(0.46, 0, 0, 5),
+    UDim2.fromOffset(90, 18),
+    11
+)
+AmountHeaderLabel.Font = Enum.Font.GothamBold
+AmountHeaderLabel.TextColor3 = Color3.fromRGB(139, 146, 159)
+
+local BlenderCountBox = makeTextBox(
+    BlenderHeader,
+    "1",
+    UDim2.new(0.46, 0, 0, 24),
+    UDim2.new(0.24, -8, 0, 28),
+    "Amount"
+)
+BlenderCountBox.ZIndex = 35
+
+--==================================================
+-- BLENDER THREE-COLUMN CONTAINERS
+--==================================================
+
+local ItemPanel = makePanel(
+    BlenderPage,
+    UDim2.new(0, 10, 0, 70),
+    UDim2.new(0.29, -7, 1, -80)
+)
+
+local RequirementPanel = makePanel(
+    BlenderPage,
+    UDim2.new(0.29, 3, 0, 70),
+    UDim2.new(0.43, -6, 1, -80)
+)
+
+local ActionsPanel = makePanel(
+    BlenderPage,
+    UDim2.new(0.72, 1, 0, 70),
+    UDim2.new(0.28, -11, 1, -80)
+)
+
+local ItemTitle = makeLabel(
+    ItemPanel,
+    "Item",
+    UDim2.fromOffset(12, 8),
+    UDim2.new(1, -24, 0, 22),
+    13
+)
+ItemTitle.Font = Enum.Font.GothamBold
+ItemTitle.TextColor3 = Color3.fromRGB(245, 247, 250)
+
+local RequirementTitle = makeLabel(
+    RequirementPanel,
+    "Requirement",
+    UDim2.fromOffset(12, 8),
+    UDim2.new(1, -24, 0, 22),
+    13
+)
+RequirementTitle.Font = Enum.Font.GothamBold
+RequirementTitle.TextColor3 = Color3.fromRGB(245, 247, 250)
+
+local ActionsTitle = makeLabel(
+    ActionsPanel,
+    "Actions",
+    UDim2.fromOffset(12, 8),
+    UDim2.new(1, -24, 0, 22),
+    13
+)
+ActionsTitle.Font = Enum.Font.GothamBold
+ActionsTitle.TextColor3 = Color3.fromRGB(245, 247, 250)
+
+--==================================================
+-- RECIPE DROPDOWN
+--==================================================
+
+local RecipeDropdown = Instance.new("ScrollingFrame")
+RecipeDropdown.Position = UDim2.fromOffset(10, 54)
+RecipeDropdown.Size = UDim2.new(1, -20, 1, -66)
+RecipeDropdown.BackgroundColor3 = Color3.fromRGB(24, 28, 36)
+RecipeDropdown.BorderSizePixel = 0
+RecipeDropdown.ScrollBarThickness = 4
+RecipeDropdown.ScrollBarImageColor3 = Color3.fromRGB(83, 90, 107)
+RecipeDropdown.ScrollBarImageTransparency = 0.2
+RecipeDropdown.CanvasSize = UDim2.fromOffset(0, 0)
+RecipeDropdown.ScrollingDirection = Enum.ScrollingDirection.Y
+RecipeDropdown.ScrollingEnabled = true
+RecipeDropdown.ClipsDescendants = true
+RecipeDropdown.Visible = false
+RecipeDropdown.ZIndex = 50
+RecipeDropdown.Parent = ItemPanel
+
+addCorner(RecipeDropdown, 8)
+addStroke(RecipeDropdown, Color3.fromRGB(53, 58, 71), 0.3, 1)
+
+local RecipeLayout = Instance.new("UIListLayout")
+RecipeLayout.Padding = UDim.new(0, 4)
+RecipeLayout.SortOrder = Enum.SortOrder.LayoutOrder
+RecipeLayout.Parent = RecipeDropdown
+
+local RecipeDropdownPadding = Instance.new("UIPadding")
+RecipeDropdownPadding.PaddingTop = UDim.new(0, 4)
+RecipeDropdownPadding.PaddingLeft = UDim.new(0, 4)
+RecipeDropdownPadding.PaddingRight = UDim.new(0, 4)
+RecipeDropdownPadding.PaddingBottom = UDim.new(0, 4)
+RecipeDropdownPadding.Parent = RecipeDropdown
+
+for _, recipeName in ipairs(RECIPES) do
+    local option = makeButton(
+        RecipeDropdown,
+        recipeName,
+        UDim2.new(),
+        UDim2.new(1, -8, 0, 30)
+    )
+
+    option.BackgroundColor3 = Color3.fromRGB(47, 47, 58)
+    option.TextXAlignment = Enum.TextXAlignment.Left
+    option.ZIndex = 51
+
+    option.MouseButton1Click:Connect(function()
+        selectedRecipe = recipeName
+        RecipeButton.Text = recipeName
+        RecipeDropdown.Visible = false
+    end)
+end
+
+local function updateRecipeCanvasSize()
+    local contentHeight = RecipeLayout.AbsoluteContentSize.Y
+    local topPadding = RecipeDropdownPadding.PaddingTop.Offset
+    local bottomPadding = RecipeDropdownPadding.PaddingBottom.Offset
+
+    RecipeDropdown.CanvasSize = UDim2.fromOffset(
+        0,
+        contentHeight + topPadding + bottomPadding + 2
+    )
+end
+
+RecipeLayout:GetPropertyChangedSignal(
+    "AbsoluteContentSize"
+):Connect(updateRecipeCanvasSize)
+
+updateRecipeCanvasSize()
+
+RecipeButton.MouseButton1Click:Connect(function()
+    RecipeDropdown.Visible = not RecipeDropdown.Visible
+end)
+
+--==================================================
+-- RECIPE DATA
+--==================================================
+
+local function getRecipe(recipeName)
+    local success, recipe = pcall(function()
+        return BlenderRecipes.Get(recipeName)
+    end)
+
+    if success and type(recipe) == "table" then
+        return recipe
+    end
+
+    return nil
+end
+
+local function calculateRecipeRequirements(
+    recipeName,
+    count
+)
+    local recipe = getRecipe(recipeName)
+
+    if not recipe then
+        return nil, "Recipe data unavailable."
+    end
+
+    if type(recipe.Ingredients) ~= "table" then
+        return nil, "Recipe ingredients unavailable."
+    end
+
+    local requirements = {}
+
+    for _, ingredient in ipairs(recipe.Ingredients) do
+        if type(ingredient) ~= "table" then
+            return nil, "Invalid ingredient data."
+        end
+
+        local itemType = ingredient.Type
+        local amount = tonumber(ingredient.Amount)
+
+        if type(itemType) ~= "string" then
+            return nil, "Invalid ingredient type."
+        end
+
+        if not amount or amount < 0 then
+            return nil, "Invalid ingredient amount."
+        end
+
+        local total = amount * count
+
+        if total > MAX_AMOUNT * MAX_BLENDER_COUNT then
+            return nil, "Calculated requirement is too large."
+        end
+
+        requirements[itemType] =
+            (requirements[itemType] or 0) + total
+    end
+
+    return requirements
+end
+
+--==================================================
+-- READ-ONLY CACHE
+--==================================================
+
+local function getCachedStats()
+    local success, stats = safeCall(function()
+        return ClientStatCache:Get()
+    end)
+
+    if success and type(stats) == "table" then
+        latestStats = stats
+        return stats
+    end
+
+    return latestStats
+end
+
+local function getHoney()
+    local stats = getCachedStats()
+
+    if stats and type(stats.Honey) == "number" then
+        return stats.Honey
+    end
+
+    return nil
+end
+
+local function getInventoryAmount(itemType)
+    local stats = getCachedStats()
+
+    if not stats then
+        return nil
+    end
+
+    if type(stats.Eggs) ~= "table" then
+        return nil
+    end
+
+    local amount = stats.Eggs[itemType]
+
+    if type(amount) == "number" then
+        return amount
+    end
+
+    return nil
+end
+
+local function getTickets()
+    return getInventoryAmount("Ticket")
+end
+
+local function getBeeCount()
+    local stats = getCachedStats()
+
+    if not stats then
+        return nil
+    end
+
+    -- Bee data is stored as a player-stat collection in the game.
+    -- Only return a value when an actual numeric count can be determined.
+    if type(stats.Bees) == "table" then
+        local count = 0
+
+        for _, bee in pairs(stats.Bees) do
+            if type(bee) == "table" then
+                count += 1
+            end
+        end
+
+        return count
+    end
+
+    if type(stats.BeeCount) == "number" then
+        return stats.BeeCount
+    end
+
+    return nil
+end
+
+local function getHiveCapacity()
+    local stats = getCachedStats()
+
+    if not stats then
+        return nil
+    end
+
+    if type(stats.UnlockedCells) == "number" then
+        return stats.UnlockedCells
+    end
+
+    return nil
+end
+
+--==================================================
+-- RECIPE REQUIREMENT CHECK
+--==================================================
+
+local function checkRecipeRequirements(recipe)
+    if not recipe then
+        return false, {
+            {
+                Message = "Recipe data unavailable.",
+                Type = "Unavailable",
+            },
+        }
+    end
+
+    local recipeRequirements = recipe.Requirements
+
+    if type(recipeRequirements) ~= "table" then
+        return true, {}
+    end
+
+    if #recipeRequirements == 0 then
+        return true, {}
+    end
+
+    local stats = getCachedStats()
+
+    if not stats then
+        return false, {
+            {
+                Message = "Cannot verify requirement.",
+                Type = "Unavailable",
+            },
+        }
+    end
+
+    local results = {}
+
+    for _, requirement in ipairs(recipeRequirements) do
+        local success, satisfied = pcall(function()
+            return StatTools.CheckReqs(
+                stats,
+                {
+                    requirement,
+                }
+            )
+        end)
+
+        if not success then
+            table.insert(results, {
+                Message = "Cannot verify requirement.",
+                Type = "Unavailable",
+            })
+        elseif not satisfied then
+            local requirementType =
+                tostring(requirement.Type or "Requirement")
+
+            local requirementSet =
+                requirement.Set
+
+            local message
+
+            if requirementSet then
+                message =
+                    requirementSet
+                    .. " badge requirement not met."
+            else
+                message =
+                    requirementType
+                    .. " requirement not met."
+            end
+
+            table.insert(results, {
+                Message = message,
+                Type = "Missing",
+            })
+        end
+    end
+
+    return #results == 0, results
+end
+
+--==================================================
+-- CRAFT CHECK
+--==================================================
+
+local function checkCanCraft(
+    recipeName,
+    count
+)
+    local recipe = getRecipe(recipeName)
+
+    if not recipe then
+        return {
+            Allowed = false,
+            Missing = {},
+            Errors = {
+                "Recipe data unavailable.",
+            },
+        }
+    end
+
+    local requirements, requirementError =
+        calculateRecipeRequirements(
+            recipeName,
+            count
+        )
+
+    if not requirements then
+        return {
+            Allowed = false,
+            Missing = {},
+            Errors = {
+                requirementError,
+            },
+        }
+    end
+
+    local missing = {}
+    local unavailable = {}
+
+    for itemType, requiredAmount in pairs(requirements) do
+        local have = getInventoryAmount(itemType)
+
+        if have == nil then
+            table.insert(unavailable, itemType)
+        elseif have < requiredAmount then
+            table.insert(missing, {
+                Type = itemType,
+                Required = requiredAmount,
+                Have = have,
+                Missing = requiredAmount - have,
+            })
+        end
+    end
+
+    if #unavailable > 0 then
+        return {
+            Allowed = false,
+            Missing = missing,
+            Unavailable = unavailable,
+            Errors = {
+                "Cannot verify inventory.",
+            },
+            Requirements = requirements,
+        }
+    end
+
+    local requirementOkay, requirementResults =
+        checkRecipeRequirements(recipe)
+
+    if not requirementOkay then
+        local errors = {}
+
+        for _, result in ipairs(requirementResults) do
+            table.insert(
+                errors,
+                result.Message
+            )
+        end
+
+        return {
+            Allowed = false,
+            Missing = missing,
+            Errors = errors,
+            RequirementResults = requirementResults,
+            Requirements = requirements,
+        }
+    end
+
+    if #missing > 0 then
+        return {
+            Allowed = false,
+            Missing = missing,
+            Errors = {},
+            RequirementResults = requirementResults,
+            Requirements = requirements,
+        }
+    end
+
+    return {
+        Allowed = true,
+        Missing = {},
+        Errors = {},
+        RequirementResults = requirementResults,
+        Requirements = requirements,
+    }
+end
+
+--==================================================
+-- BLENDER MATERIAL DISPLAY
+--==================================================
+
+local MaterialList = makeScrollingList(
+    RequirementPanel,
+    UDim2.fromOffset(10, 38),
+    UDim2.new(1, -20, 1, -92)
+)
+
+local BlenderStatus = makeLabel(
+    RequirementPanel,
+    "Status: Checking...",
+    UDim2.new(0, 10, 1, -48),
+    UDim2.new(1, -20, 0, 38),
+    11
+)
+
+BlenderStatus.BackgroundColor3 =
+    Color3.fromRGB(39, 39, 48)
+
+BlenderStatus.BackgroundTransparency = 0
+BlenderStatus.TextWrapped = true
+BlenderStatus.TextYAlignment =
+    Enum.TextYAlignment.Center
+BlenderStatus.ZIndex = 15
+
+addCorner(BlenderStatus, 7)
+addStroke(BlenderStatus, Color3.fromRGB(53, 58, 70), 0.4, 1)
+
+local function clearMaterialList()
+    for _, child in ipairs(MaterialList:GetChildren()) do
+        if child:IsA("TextLabel") then
+            child:Destroy()
+        end
+    end
+end
+
+local function addMaterialRow(
+    itemType,
+    required,
+    have,
+    missing
+)
+    local row = Instance.new("TextLabel")
+
+    row.Size = UDim2.new(1, -6, 0, 27)
+    row.BackgroundColor3 = Color3.fromRGB(31, 35, 44)
+    row.BorderSizePixel = 0
+    row.TextColor3 = Color3.fromRGB(220, 224, 232)
+    row.TextSize = 11
+    row.Font = Enum.Font.Gotham
+    row.TextXAlignment = Enum.TextXAlignment.Left
+    row.Text = string.format(
+        "%-17s Required: %-9s Have: %-9s Missing: %s",
+        itemType,
+        formatNumber(required),
+        have == nil and "N/A" or formatNumber(have),
+        missing == nil and "N/A" or formatNumber(missing)
+    )
+    row.Parent = MaterialList
+
+    addCorner(row, 7)
+    addStroke(row, Color3.fromRGB(53, 58, 70), 0.45, 1)
+
+    local padding = Instance.new("UIPadding")
+    padding.PaddingLeft = UDim.new(0, 7)
+    padding.PaddingRight = UDim.new(0, 6)
+    padding.Parent = row
+
+    return row
+end
+
+--==================================================
+-- LIVE CRAFT STATUS
+--==================================================
+
+local function updateBlenderMaterials()
+    clearMaterialList()
+
+    local count, errorMessage =
+        validatePositiveInteger(
+            BlenderCountBox.Text,
+            MAX_BLENDER_COUNT
+        )
+
+    if not count then
+        BlenderStatus.Text =
+            "Status: " .. errorMessage
+
+        BlenderStatus.TextColor3 =
+            Color3.fromRGB(255, 100, 100)
+
+        return {
+            Allowed = false,
+        }
+    end
+
+    local recipe =
+        getRecipe(selectedRecipe)
+
+    if not recipe then
+        BlenderStatus.Text =
+            "Status: Recipe data unavailable."
+
+        BlenderStatus.TextColor3 =
+            Color3.fromRGB(255, 100, 100)
+
+        return {
+            Allowed = false,
+        }
+    end
+
+    local requirements =
+        calculateRecipeRequirements(
+            selectedRecipe,
+            count
+        )
+
+    if not requirements then
+        BlenderStatus.Text =
+            "Status: Unable to calculate recipe."
+
+        BlenderStatus.TextColor3 =
+            Color3.fromRGB(255, 100, 100)
+
+        return {
+            Allowed = false,
+        }
+    end
+
+    local result =
+        checkCanCraft(
+            selectedRecipe,
+            count
+        )
+
+    local keys = {}
+
+    for itemType in pairs(requirements) do
+        table.insert(keys, itemType)
+    end
+
+    table.sort(keys)
+
+    for _, itemType in ipairs(keys) do
+        local required = requirements[itemType]
+        local have = getInventoryAmount(itemType)
+
+        local missing
+
+        if have == nil then
+            missing = nil
+        else
+            missing = math.max(
+                required - have,
+                0
+            )
+        end
+
+        addMaterialRow(
+            itemType,
+            required,
+            have,
+            missing
+        )
+    end
+
+    if #result.Errors > 0 then
+        BlenderStatus.Text =
+            "Status: " ..
+            table.concat(
+                result.Errors,
+                " "
+            )
+
+        BlenderStatus.TextColor3 =
+            Color3.fromRGB(255, 100, 100)
+
+    elseif result.Unavailable and
+        #result.Unavailable > 0 then
+
+        BlenderStatus.Text =
+            "Status: Cannot verify inventory."
+
+        BlenderStatus.TextColor3 =
+            Color3.fromRGB(255, 180, 80)
+
+    elseif #result.Missing > 0 then
+        local messages = {}
+
+        for _, missing in ipairs(result.Missing) do
+            table.insert(
+                messages,
+                missing.Type
+                    .. " x"
+                    .. formatNumber(
+                        missing.Missing
+                    )
+            )
+        end
+
+        BlenderStatus.Text =
+            "Status: Missing materials: "
+            .. table.concat(
+                messages,
+                ", "
+            )
+
+        BlenderStatus.TextColor3 =
+            Color3.fromRGB(255, 100, 100)
+
+    else
+        BlenderStatus.Text =
+            "Status: ✓ Ready to craft."
+
+        BlenderStatus.TextColor3 =
+            Color3.fromRGB(105, 240, 135)
+    end
+
+    return result
+end
+
+--==================================================
+-- RECIPE CHANGES / COUNT CHANGES
+--==================================================
+
+RecipeButton.MouseButton1Click:Connect(
+    function()
+        task.defer(updateBlenderMaterials)
+    end
+)
+
+BlenderCountBox:GetPropertyChangedSignal(
+    "Text"
+):Connect(function()
+    updateBlenderMaterials()
+end)
+
+--==================================================
+-- CRAFT / STOP / SPEED BUTTONS
+--==================================================
+
+local CraftButton = makeButton(
+    ActionsPanel,
+    "Craft",
+    UDim2.fromOffset(10, 38),
+    UDim2.new(1, -20, 0, 38)
+)
+
+local StopCraftingButton = makeButton(
+    ActionsPanel,
+    "For Crafting",
+    UDim2.fromOffset(10, 82),
+    UDim2.new(1, -20, 0, 38)
+)
+
+StopCraftingButton.BackgroundColor3 =
+    Color3.fromRGB(155, 65, 70)
+
+local SpeedUpButton = makeButton(
+    ActionsPanel,
+    "Speed Up",
+    UDim2.fromOffset(10, 126),
+    UDim2.new(1, -20, 0, 38)
+)
+
+SpeedUpButton.BackgroundColor3 =
+    Color3.fromRGB(180, 125, 45)
+
+--==================================================
+-- SPEED UP INFORMATION
+--==================================================
+
+local SpeedPanel = makePanel(
+    ActionsPanel,
+    UDim2.fromOffset(10, 174),
+    UDim2.new(1, -20, 1, -184)
+)
+
+local SpeedPanelTitle = makeLabel(
+    SpeedPanel,
+    "Speed up cost",
+    UDim2.fromOffset(10, 9),
+    UDim2.new(1, -20, 0, 20),
+    12
+)
+SpeedPanelTitle.Font = Enum.Font.GothamBold
+SpeedPanelTitle.TextColor3 = Color3.fromRGB(245, 247, 250)
+
+local CurrentTicketsLabel = makeLabel(
+    SpeedPanel,
+    "🎟️ Current Tickets: N/A",
+    UDim2.fromOffset(10, 42),
+    UDim2.new(1, -20, 0, 30),
+    11
+)
+CurrentTicketsLabel.TextWrapped = true
+
+local SpeedCostLabel = makeLabel(
+    SpeedPanel,
+    "🎟️ Speed Up Cost: N/A",
+    UDim2.fromOffset(10, 82),
+    UDim2.new(1, -20, 0, 30),
+    11
+)
+SpeedCostLabel.TextWrapped = true
+
+local TicketsRemainingLabel = makeLabel(
+    SpeedPanel,
+    "🎟️ After Speed Up: N/A",
+    UDim2.fromOffset(10, 122),
+    UDim2.new(1, -20, 0, 30),
+    11
+)
+TicketsRemainingLabel.TextWrapped = true
+
+--==================================================
+-- SPEED UP COST CALCULATION
+--==================================================
+
+local function getCurrentSpeedUpCost()
+    local stats = getCachedStats()
+
+    if not stats then
+        return nil
+    end
+
+    local blenderState = stats.BlenderState
+
+    if type(blenderState) ~= "table" then
+        return nil
+    end
+
+    local recipeName = blenderState.Recipe
+    local count = tonumber(blenderState.Count)
+
+    if type(recipeName) ~= "string" then
+        return nil
+    end
+
+    if not count or count <= 0 then
+        return nil
+    end
+
+    local recipe = getRecipe(recipeName)
+
+    if not recipe then
+        return nil
+    end
+
+    local autoCompletePerTicket =
+        tonumber(
+            recipe.AutoCompletePerTicket
+        )
+
+    local recipeTime =
+        tonumber(recipe.Time)
+
+    if not autoCompletePerTicket
+        or autoCompletePerTicket <= 0
+        or not recipeTime
+        or recipeTime <= 0 then
+
+        return nil
+    end
+
+    local playtimeAtLoad =
+        tonumber(
+            stats.PlaytimeAtLoad
+        )
+
+    local loadTime =
+        tonumber(
+            stats.LoadTime
+        )
+
+    local offlineProgressTime =
+        tonumber(
+            stats.OfflineProgressTime
+        ) or 0
+
+    if not playtimeAtLoad
+        or not loadTime then
+
+        return nil
+    end
+
+    local now = os.time()
+
+    local elapsed =
+        playtimeAtLoad
+        + (now - loadTime)
+        + offlineProgressTime
+        - (tonumber(
+            blenderState.StartTime
+        ) or 0)
+
+    local totalTime =
+        count * recipeTime
+
+    if totalTime <= 0 then
+        return nil
+    end
+
+    local progress =
+        math.clamp(
+            elapsed / totalTime,
+            0,
+            1
+        )
+
+    local completed =
+        math.floor(
+            progress * count
+        )
+
+    local cost =
+        math.ceil(
+            (
+                count
+                - completed
+            )
+            / autoCompletePerTicket
+        )
+
+    if cost < 0 then
+        cost = 0
+    end
+
+    return cost
+end
+
+local function updateSpeedUpDisplay()
+    local currentTickets =
+        getTickets()
+
+    local speedUpCost =
+        getCurrentSpeedUpCost()
+
+    if currentTickets == nil then
+        CurrentTicketsLabel.Text =
+            "🎟️ Current Tickets: N/A"
+    else
+        CurrentTicketsLabel.Text =
+            "🎟️ Current Tickets: "
+            .. formatNumber(currentTickets)
+    end
+
+    if speedUpCost == nil then
+        SpeedCostLabel.Text =
+            "🎟️ Speed Up Cost: N/A"
+
+        TicketsRemainingLabel.Text =
+            "🎟️ After Speed Up: N/A"
+
+        return
+    end
+
+    SpeedCostLabel.Text =
+        "🎟️ Speed Up Cost: "
+        .. formatNumber(speedUpCost)
+
+    if currentTickets == nil then
+        TicketsRemainingLabel.Text =
+            "🎟️ After Speed Up: N/A"
+    else
+        TicketsRemainingLabel.Text =
+            "🎟️ After Speed Up: "
+            .. formatNumber(
+                currentTickets
+                - speedUpCost
+            )
+    end
+end
+
+--==================================================
+-- CRAFT BUTTON
+--==================================================
+
+CraftButton.MouseButton1Click:Connect(
+    function()
+        local count, errorMessage =
+            validatePositiveInteger(
+                BlenderCountBox.Text,
+                MAX_BLENDER_COUNT
+            )
+
+        if not count then
+            BlenderStatus.Text =
+                "Status: "
+                .. errorMessage
+
+            BlenderStatus.TextColor3 =
+                Color3.fromRGB(
+                    255,
+                    100,
+                    100
+                )
+
+            return
+        end
+
+        local result =
+            checkCanCraft(
+                selectedRecipe,
+                count
+            )
+
+        if not result.Allowed then
+            updateBlenderMaterials()
+
+            return
+        end
+
+        local success =
+            invokeBlender(
+                "PlaceOrder",
+                {
+                    Recipe = selectedRecipe,
+                    Count = count,
+                },
+                "Craft request completed."
+            )
+
+        if success then
+            task.wait(0.1)
+            updateBlenderMaterials()
+            updateSpeedUpDisplay()
+        end
+    end
+)
+
+--==================================================
+-- STOP CRAFTING
+--==================================================
+
+StopCraftingButton.MouseButton1Click:Connect(
+    function()
+        local success =
+            invokeBlender(
+                "StopOrder",
+                nil,
+                "Stop crafting request completed."
+            )
+
+        if success then
+            task.wait(0.1)
+            updateBlenderMaterials()
+            updateSpeedUpDisplay()
+        end
+    end
+)
+
+--==================================================
+-- SPEED UP
+--==================================================
+
+SpeedUpButton.MouseButton1Click:Connect(
+    function()
+        local cost =
+            getCurrentSpeedUpCost()
+
+        if cost == nil then
+            setStatus(
+                "Speed Up cost is unavailable.",
+                "error"
+            )
+            return
+        end
+
+        local tickets =
+            getTickets()
+
+        if tickets == nil then
+            setStatus(
+                "Cannot verify Tickets.",
+                "error"
+            )
+            return
+        end
+
+        if tickets < cost then
+            setStatus(
+                "Not enough Tickets for Speed Up.",
+                "error"
+            )
+            return
+        end
+
+        local success =
+            invokeBlender(
+                "SpeedUpOrder",
+                nil,
+                "Speed Up request completed."
+            )
+
+        if success then
+            task.wait(0.1)
+            updateSpeedUpDisplay()
+            updateBlenderMaterials()
+        end
+    end
+)
+
+--==================================================
+-- PAGE 4: TICKETS
+--==================================================
+
+local TicketsPage = createPage("Tickets")
+local TicketsTab = createTab("Tickets")
+
+local TicketPanel = makePanel(
+    TicketsPage,
+    UDim2.fromOffset(12, 12),
+    UDim2.new(1, -24, 0, 120)
+)
+
+makeLabel(
+    TicketPanel,
+    "Ticket Amount",
+    UDim2.fromOffset(14, 10),
+    UDim2.fromOffset(150, 22),
+    13
+)
+
+local TicketButtonFrame = Instance.new("Frame")
+TicketButtonFrame.Position =
+    UDim2.fromOffset(14, 38)
+TicketButtonFrame.Size =
+    UDim2.new(1, -28, 0, 34)
+TicketButtonFrame.BackgroundTransparency = 1
+TicketButtonFrame.Parent = TicketPanel
+
+local TicketLayout = Instance.new("UIListLayout")
+TicketLayout.FillDirection =
+    Enum.FillDirection.Horizontal
+TicketLayout.Padding =
+    UDim.new(0, 6)
+TicketLayout.Parent = TicketButtonFrame
+
+local TicketButtons = {}
+
+local function updateTicketButtons()
+    for amount, button in pairs(TicketButtons) do
+        if amount == selectedTicketAmount then
+            button.BackgroundColor3 =
+                Color3.fromRGB(62, 97, 176)
+        else
+            button.BackgroundColor3 =
+                Color3.fromRGB(38, 43, 53)
+        end
+    end
+end
+
+for _, amount in ipairs(TICKET_AMOUNTS) do
+    local button = makeButton(
+        TicketButtonFrame,
+        tostring(amount),
+        UDim2.new(),
+        UDim2.fromOffset(85, 34)
+    )
+
+    button.BackgroundColor3 =
+        Color3.fromRGB(38, 43, 53)
+
+    button.TextColor3 = Color3.fromRGB(203, 209, 219)
+    TicketButtons[amount] = button
+
+    button.MouseButton1Click:Connect(function()
+        selectedTicketAmount = amount
+        updateTicketButtons()
+    end)
+end
+
+local TicketPurchaseButton = makeButton(
+    TicketPanel,
+    "Purchase Ticket",
+    UDim2.fromOffset(14, 79),
+    UDim2.new(1, -28, 0, 34)
+)
+
+TicketPurchaseButton.MouseButton1Click:Connect(
+    function()
+        purchaseItem(
+            "Ticket",
+            selectedTicketAmount,
+            "Ticket"
+        )
+    end
+)
+
+updateTicketButtons()
+
+--==================================================
+-- PAGE 5: PLAYER INFO
+--==================================================
+
+local PlayerInfoPage =
+    createPage("Player Info")
+
+local PlayerInfoTab =
+    createTab("Player Info")
+
+local PlayerInfoPanel =
+    makePanel(
+        PlayerInfoPage,
+        UDim2.fromOffset(12, 12),
+        UDim2.new(1, -24, 0, 245)
+    )
+
+local PlayerInfoText =
+    makeLabel(
+        PlayerInfoPanel,
+        "",
+        UDim2.fromOffset(15, 12),
+        UDim2.new(1, -30, 1, -24),
+        14
+    )
+
+PlayerInfoText.TextYAlignment =
+    Enum.TextYAlignment.Top
+
+PlayerInfoText.TextWrapped = true
+
+--==================================================
+-- PAGE 6: INVENTORY
+--==================================================
+
+local InventoryPage =
+    createPage("Inventory")
+
+local InventoryTab =
+    createTab("Inventory")
+
+makeLabel(
+    InventoryPage,
+    "Locally Available Inventory",
+    UDim2.fromOffset(12, 4),
+    UDim2.new(1, -24, 0, 25),
+    14
+)
+
+local InventoryScroll =
+    makeScrollingList(
+        InventoryPage,
+        UDim2.fromOffset(12, 34),
+        UDim2.new(1, -24, 1, -40)
+    )
+
+local InventoryLabels = {}
+
+for _, itemType in ipairs(INVENTORY_ITEMS) do
+    local row =
+        Instance.new("TextLabel")
+
+    row.Size =
+        UDim2.new(1, -8, 0, 26)
+    row.BackgroundColor3 =
+        Color3.fromRGB(31, 35, 44)
+    row.BorderSizePixel = 0
+    row.Text =
+        itemType .. ": N/A"
+    row.TextColor3 =
+        Color3.fromRGB(225, 225, 230)
+    row.TextSize = 11
+    row.Font =
+        Enum.Font.Gotham
+    row.TextXAlignment =
+        Enum.TextXAlignment.Left
+    row.Parent =
+        InventoryScroll
+
+    addCorner(row, 7)
+    addStroke(row, Color3.fromRGB(53, 58, 70), 0.45, 1)
+
+    local padding =
+        Instance.new("UIPadding")
+    padding.PaddingLeft =
+        UDim.new(0, 8)
+    padding.Parent = row
+
+    InventoryLabels[itemType] =
+        row
+end
+
+--==================================================
+-- PAGE 7: RECIPE CALCULATOR
+--==================================================
+
+local CalculatorPage =
+    createPage("Recipe Calculator")
+
+local CalculatorTab =
+    createTab("Recipe Calculator")
+
+local CalculatorTop =
+    makePanel(
+        CalculatorPage,
+        UDim2.fromOffset(10, 8),
+        UDim2.new(1, -20, 0, 63)
+    )
+
+local CalculatorRecipeButton =
+    makeButton(
+        CalculatorTop,
+        selectedRecipe,
+        UDim2.fromOffset(12, 26),
+        UDim2.fromOffset(220, 30)
+    )
+
+local CalculatorCountBox =
+    makeTextBox(
+        CalculatorTop,
+        "1",
+        UDim2.fromOffset(244, 26),
+        UDim2.fromOffset(95, 30),
+        "Quantity"
+    )
+
+makeLabel(
+    CalculatorTop,
+    "Recipe",
+    UDim2.fromOffset(12, 4),
+    UDim2.fromOffset(80, 18),
+    10
+)
+
+makeLabel(
+    CalculatorTop,
+    "Quantity",
+    UDim2.fromOffset(244, 4),
+    UDim2.fromOffset(80, 18),
+    10
+)
+
+local CalculatorDropdown =
+    Instance.new("ScrollingFrame")
+
+CalculatorDropdown.Position =
+    UDim2.fromOffset(12, 57)
+CalculatorDropdown.Size =
+    UDim2.fromOffset(220, 0)
+CalculatorDropdown.BackgroundColor3 =
+    Color3.fromRGB(43, 43, 53)
+CalculatorDropdown.BorderSizePixel = 0
+CalculatorDropdown.Visible = false
+CalculatorDropdown.ScrollBarThickness = 4
+CalculatorDropdown.ZIndex = 30
+CalculatorDropdown.Parent = CalculatorTop
+
+addCorner(CalculatorDropdown, 7)
+
+local CalculatorDropLayout =
+    Instance.new("UIListLayout")
+
+CalculatorDropLayout.Padding =
+    UDim.new(0, 2)
+CalculatorDropLayout.Parent =
+    CalculatorDropdown
+
+for _, recipeName in ipairs(RECIPES) do
+    local option =
+        makeButton(
+            CalculatorDropdown,
+            recipeName,
+            UDim2.new(),
+            UDim2.new(1, -4, 0, 28)
+        )
+
+    option.ZIndex = 31
+    option.BackgroundColor3 =
+        Color3.fromRGB(47, 47, 58)
+
+    option.MouseButton1Click:Connect(
+        function()
+            selectedRecipe = recipeName
+
+            CalculatorRecipeButton.Text =
+                recipeName
+
+            RecipeButton.Text =
+                recipeName
+
+            CalculatorDropdown.Visible =
+                false
+
+            updateBlenderMaterials()
+            updateCalculator()
+        end
+    )
+end
+
+CalculatorDropLayout:GetPropertyChangedSignal(
+    "AbsoluteContentSize"
+):Connect(function()
+    CalculatorDropdown.CanvasSize =
+        UDim2.fromOffset(
+            0,
+            CalculatorDropLayout
+                .AbsoluteContentSize.Y
+                + 6
+        )
+
+    CalculatorDropdown.Size =
+        UDim2.fromOffset(
+            220,
+            math.min(
+                CalculatorDropLayout
+                    .AbsoluteContentSize.Y + 6,
+                185
+            )
+        )
+end)
+
+CalculatorRecipeButton.MouseButton1Click:Connect(
+    function()
+        CalculatorDropdown.Visible =
+            not CalculatorDropdown.Visible
+    end
+)
+
+local CalculatorList =
+    makeScrollingList(
+        CalculatorPage,
+        UDim2.fromOffset(10, 79),
+        UDim2.new(1, -20, 1, -85)
+    )
+
+local function clearCalculator()
+    for _, child in ipairs(
+        CalculatorList:GetChildren()
+    ) do
+        if child:IsA("TextLabel") then
+            child:Destroy()
+        end
+    end
+end
+
+local function addCalculatorRow(
+    itemType,
+    required,
+    have,
+    missing
+)
+    local row =
+        Instance.new("TextLabel")
+
+    row.Size =
+        UDim2.new(1, -8, 0, 29)
+
+    row.BackgroundColor3 =
+        Color3.fromRGB(31, 35, 44)
+
+    row.BorderSizePixel = 0
+
+    row.TextColor3 =
+        Color3.fromRGB(225, 225, 230)
+
+    row.TextSize = 11
+
+    row.Font =
+        Enum.Font.Gotham
+
+    row.TextXAlignment =
+        Enum.TextXAlignment.Left
+
+    row.Text =
+        string.format(
+            "%-18s Required: %-10s Have: %-10s Missing: %s",
+            itemType,
+            formatNumber(required),
+            have == nil
+                and "N/A"
+                or formatNumber(have),
+            missing == nil
+                and "N/A"
+                or formatNumber(missing)
+        )
+
+    row.Parent =
+        CalculatorList
+
+    addCorner(row, 7)
+    addStroke(row, Color3.fromRGB(53, 58, 70), 0.45, 1)
+
+    local padding =
+        Instance.new("UIPadding")
+
+    padding.PaddingLeft =
+        UDim.new(0, 8)
+
+    padding.Parent =
+        row
+end
+
+function updateCalculator()
+    clearCalculator()
+
+    local count, errorMessage =
+        validatePositiveInteger(
+            CalculatorCountBox.Text,
+            MAX_BLENDER_COUNT
+        )
+
+    if not count then
+        addCalculatorRow(
+            "ERROR",
+            0,
+            errorMessage,
+            nil
+        )
+        return
+    end
+
+    local requirements =
+        calculateRecipeRequirements(
+            selectedRecipe,
+            count
+        )
+
+    if not requirements then
+        addCalculatorRow(
+            "ERROR",
+            0,
+            "Recipe unavailable",
+            nil
+        )
+        return
+    end
+
+    local keys = {}
+
+    for itemType in pairs(requirements) do
+        table.insert(
+            keys,
+            itemType
+        )
+    end
+
+    table.sort(keys)
+
+    for _, itemType in ipairs(keys) do
+        local required =
+            requirements[itemType]
+
+        local have =
+            getInventoryAmount(itemType)
+
+        local missing
+
+        if have ~= nil then
+            missing =
+                math.max(
+                    required - have,
+                    0
+                )
+        end
+
+        addCalculatorRow(
+            itemType,
+            required,
+            have,
+            missing
+        )
+    end
+end
+
+CalculatorCountBox:GetPropertyChangedSignal(
+    "Text"
+):Connect(updateCalculator)
+
+--==================================================
+-- INITIAL GUI DATA
+--==================================================
+
+local function refreshPlayerInfo()
+    local honey = getHoney()
+    local tickets = getTickets()
+    local beeCount = getBeeCount()
+    local hiveCapacity = getHiveCapacity()
+
+    local hiveText = "N/A"
+
+    if beeCount ~= nil
+        and hiveCapacity ~= nil then
+
+        hiveText =
+            formatNumber(beeCount)
+            .. " / "
+            .. formatNumber(hiveCapacity)
+
+    elseif hiveCapacity ~= nil then
+        hiveText =
+            "? / "
+            .. formatNumber(hiveCapacity)
+
+    elseif beeCount ~= nil then
+        hiveText =
+            formatNumber(beeCount)
+            .. " Bees"
+    end
+
+    StatBar.Text =
+        "🍯 Honey: "
+        .. (honey == nil
+            and "N/A"
+            or formatNumber(honey))
+        .. "    🐝 Hive: "
+        .. hiveText
+        .. "    🎟️ Tickets: "
+        .. (tickets == nil
+            and "N/A"
+            or formatNumber(tickets))
+
+    PlayerInfoText.Text =
+        "PLAYER INFORMATION\n\n"
+        .. "Player: "
+        .. tostring(LocalPlayer.Name)
+        .. "\n"
+        .. "Display: "
+        .. tostring(LocalPlayer.DisplayName)
+        .. "\n"
+        .. "UserId: "
+        .. tostring(LocalPlayer.UserId)
+        .. "\n\n"
+        .. "🍯 Honey: "
+        .. (
+            honey == nil
+            and "N/A"
+            or formatNumber(honey)
+        )
+        .. "\n"
+        .. "🎟️ Tickets: "
+        .. (
+            tickets == nil
+            and "N/A"
+            or formatNumber(tickets)
+        )
+        .. "\n"
+        .. "🐝 Hive: "
+        .. hiveText
+end
+
+local function refreshInventory()
+    for _, itemType in ipairs(
+        INVENTORY_ITEMS
+    ) do
+        local amount =
+            getInventoryAmount(itemType)
+
+        if amount == nil then
+            InventoryLabels[itemType].Text =
+                itemType .. ": N/A"
+        else
+            InventoryLabels[itemType].Text =
+                itemType
+                .. ": "
+                .. formatNumber(amount)
+        end
+    end
+end
+
+local function refreshAllReadOnly()
+    refreshPlayerInfo()
+    refreshInventory()
+    updateCalculator()
+    updateBlenderMaterials()
+    updateSpeedUpDisplay()
+end
+
+--==================================================
+-- CACHE REFRESH HOOK
+--==================================================
+
+pcall(function()
+    ClientStatCache:OnRefresh(
+        function(stats)
+            if type(stats) == "table" then
+                latestStats = stats
+            end
+
+            task.defer(function()
+                if ScreenGui.Parent then
+                    refreshAllReadOnly()
+                end
+            end)
+        end
+    )
+end)
+
+--==================================================
+-- BLENDER RECIPE UPDATE EVENTS
+--==================================================
+
+local function synchronizeRecipe()
+    RecipeButton.Text = selectedRecipe
+    CalculatorRecipeButton.Text = selectedRecipe
+
+    updateBlenderMaterials()
+    updateCalculator()
+end
+
+CalculatorRecipeButton.MouseButton1Click:Connect(
+    function()
+        synchronizeRecipe()
+    end
+)
+
+--==================================================
+-- TAB CONNECTIONS
+--==================================================
+
+RoyalTab.MouseButton1Click:Connect(
+    function()
+        selectTab("Royal Jelly")
+    end
+)
+
+EggsTab.MouseButton1Click:Connect(
+    function()
+        selectTab("Eggs")
+    end
+)
+
+BlenderTab.MouseButton1Click:Connect(
+    function()
+        selectTab("Blender")
+        updateBlenderMaterials()
+        updateSpeedUpDisplay()
+    end
+)
+
+TicketsTab.MouseButton1Click:Connect(
+    function()
+        selectTab("Tickets")
+    end
+)
+
+PlayerInfoTab.MouseButton1Click:Connect(
+    function()
+        selectTab("Player Info")
+    end
+)
+
+InventoryTab.MouseButton1Click:Connect(
+    function()
+        selectTab("Inventory")
+    end
+)
+
+CalculatorTab.MouseButton1Click:Connect(
+    function()
+        selectTab("Recipe Calculator")
+        updateCalculator()
+    end
+)
+
+--==================================================
+-- MINIMIZE
+--==================================================
+
+local minimized = false
+Main.Visible = true
+MiniBox.Visible = false
+
+local function hideMainPanel()
+    minimized = true
+
+    MiniBox.Position = UDim2.new(1, -190, 1, -66)
+    Main.Visible = false
+    MiniBox.Visible = true
+end
+
+local function showMainPanel()
+    minimized = false
+
+    Main.Visible = true
+    MiniBox.Visible = false
+    MinimizeButton.Text = "—"
+end
+
+MiniBox.MouseButton1Click:Connect(
+    function()
+        showMainPanel()
+    end
+)
+
+MinimizeButton.MouseButton1Click:Connect(
+    function()
+        hideMainPanel()
+    end
+)
+
+--==================================================
+-- CLOSE
+--==================================================
+
+CloseButton.MouseButton1Click:Connect(
+    function()
+        hideMainPanel()
+    end
+)
+
+--==================================================
+-- DRAGGING
+--==================================================
+
+local dragging = false
+local dragStart
+local startPosition
+
+Header.InputBegan:Connect(
+    function(input)
+        if input.UserInputType
+            == Enum.UserInputType.MouseButton1
+            or input.UserInputType
+            == Enum.UserInputType.Touch then
+
+            dragging = true
+            dragStart = input.Position
+            startPosition = Main.Position
+
+            input.Changed:Connect(
+                function()
+                    if input.UserInputState
+                        == Enum.UserInputState.End then
+
+                        dragging = false
+                    end
+                end
+            )
+        end
+    end
+)
+
+UserInputService.InputChanged:Connect(
+    function(input)
+        if not dragging then
+            return
+        end
+
+        if input.UserInputType
+            ~= Enum.UserInputType.MouseMovement
+            and input.UserInputType
+            ~= Enum.UserInputType.Touch then
+            return
+        end
+
+        local delta =
+            input.Position - dragStart
+
+        Main.Position =
+            UDim2.new(
+                startPosition.X.Scale,
+                startPosition.X.Offset
+                    + delta.X,
+
+                startPosition.Y.Scale,
+                startPosition.Y.Offset
+                    + delta.Y
+            )
+    end
+)
+
+--==================================================
+-- REFRESH / UPDATE METHODS
+--==================================================
+
+local function refresh()
+    if not ScreenGui.Parent then
+        return
+    end
+
+    refreshAllReadOnly()
+end
+
+-- Initial refresh
+selectTab("Royal Jelly")
+refresh()
+
+-- Periodic refresh
+task.spawn(function()
+    while ScreenGui.Parent do
+        task.wait(REFRESH_INTERVAL)
+
+        if not ScreenGui.Parent then
+            break
+        end
+
+        refresh()
+    end
+end)
+
+--==================================================
+-- STARTUP STATUS
+--==================================================
+
+setStatus(
+    "Ready",
+    "success"
+)
